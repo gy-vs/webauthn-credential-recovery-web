@@ -1,0 +1,26 @@
+{
+  "name": "webauthn-ceremony-lab",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "concurrently -n server,web -c blue,green \"npm:dev:server\" \"npm:dev:web\"",
+    "dev:server": "npm --workspace @lab/server run dev",
+    "dev:web": "npm --workspace @lab/web run dev",
+    "build": "npm --workspace @lab/web run build",
+    "start": "npm --workspace @lab/server run start",
+    "test": "vitest run",
+    "typecheck": "npm --workspace @lab/shared run typecheck && npm --workspace @lab/server run typecheck && npm --workspace @lab/web run typecheck"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/supertest": "^6.0.2",
+    "concurrently": "^8.2.2",
+    "supertest": "^6.3.4",
+    "typescript": "^5.4.5",
+    "vitest": "^1.6.0"
+  }
+}
