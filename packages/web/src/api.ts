@@ -4,6 +4,7 @@ import type {
   AttestationResponseDTO,
   AuthenticationOptionsDTO,
   CeremonySummary,
+  CredentialDispositionAction,
   RegistrationOptionsDTO,
   StoredCredentialInfo,
 } from '@lab/shared';
@@ -13,6 +14,15 @@ export interface ServerConfig {
   rpName: string;
   expectedOrigins: string[];
   defaultTtlMs: number;
+}
+
+export interface ApiError {
+  ok: false;
+  code?: string;
+  message?: string;
+  /** 处置冲突时服务端返回的当前凭据快照 */
+  current?: StoredCredentialInfo;
+  checks?: unknown;
 }
 
 async function http<T>(method: string, url: string, body?: unknown): Promise<{ status: number; data: T }> {
@@ -33,6 +43,7 @@ export const api = {
     userVerification: string;
     attestation: string;
     ttlMs?: number;
+    recoveryOf?: string;
   }) => http<RegistrationOptionsDTO>('POST', '/api/register/options', body),
   registerResult: (body: AttestationResponseDTO) =>
     http<Record<string, unknown>>('POST', '/api/register/result', body),
@@ -47,5 +58,7 @@ export const api = {
   cancelCeremony: (id: string) => http<{ ceremonyId: string; status: string }>('POST', `/api/ceremonies/${id}/cancel`),
   ceremonies: () => http<CeremonySummary[]>('GET', '/api/ceremonies'),
   credentials: () => http<StoredCredentialInfo[]>('GET', '/api/credentials'),
+  disposition: (id: string, body: { action: CredentialDispositionAction; expectedVersion?: number }) =>
+    http<{ ok: true; credential: StoredCredentialInfo } | ApiError>('POST', `/api/credentials/${id}/disposition`, body),
   reset: () => http<{ ok: boolean }>('POST', '/api/reset'),
 };

@@ -8,11 +8,12 @@ import {
   type AuthenticationOptionsDTO,
   type CeremonyStatus,
   type CheckResult,
+  type CredentialDispositionAction,
   type CryptoProvider,
   type FailureCode,
   type RegistrationOptionsDTO,
 } from '@lab/shared';
-import { LabStore, type CeremonyState } from './store.js';
+import { LabStore, type CeremonyState, type StoredCredential } from './store.js';
 
 export interface ServerConfig {
   rpId: string;
@@ -50,6 +51,18 @@ function clampTtl(requested: unknown, config: ServerConfig): number {
   return Math.min(Math.max(250, n), config.maxTtlMs);
 }
 
+function credentialInfo(cred: StoredCredential) {
+  return {
+    credentialId: cred.credentialId,
+    disposition: cred.disposition,
+    dispositionVersion: cred.dispositionVersion,
+    cloneWarningCeremonyId: cred.cloneWarningCeremonyId,
+    replacedByCredentialId: cred.replacedByCredentialId,
+    recoveryOfCredentialId: cred.recoveryOfCredentialId,
+    recoveryCeremonyId: cred.recoveryCeremonyId,
+  };
+}
+
 export function createApp(deps: AppDeps): Express {
   const { store, crypto, config } = deps;
   const app = express();
@@ -81,6 +94,8 @@ export function createApp(deps: AppDeps): Express {
         userVerification?: 'required' | 'preferred' | 'discouraged';
         attestation?: 'none' | 'direct';
         ttlMs?: number;
+        /** 恢复注册：替代该用户名下处于隔离中的异常凭据 */
+        recoveryOf?: string;
       };
       const userName = body.userName?.trim();
       if (!userName) {
@@ -91,11 +106,38 @@ export function createApp(deps: AppDeps): Express {
       const challenge = b64uEncode(crypto.randomBytes(32));
       const ttl = clampTtl(body.ttlMs, config);
 
-      const excludeCredentials = store.credentialsForUser(userName).map((c) => ({
+      const allForUser = store.credentialsForUser(userName);
+      const excludeCredentials = allForUser.map((c) => ({
         type: 'public-key' as const,
         id: c.credentialId,
         transports: ['internal'],
       }));
+
+      // 恢复注册：目标必须存在、属于同一用户、且当前处于隔离中；
+      // 版本在签发时快照，提交时复检（completeRecovery）。
+      let recoverySnapshot: { credentialId: string; dispositionVersion: number } | undefined;
+      if (body.recoveryOf !== undefined && body.recoveryOf !== null && body.recoveryOf !== '') {
+        const recoveryOf = String(body.recoveryOf);
+        const target = store.getCredential(recoveryOf);
+        if (!target || target.userName !== userName) {
+          res.status(404).json({
+            ok: false,
+            code: 'recovery_target_invalid',
+            message: `恢复目标凭据 ${recoveryOf} 不存在或不属于用户 ${userName}`,
+          });
+          return;
+        }
+        if (target.disposition !== 'quarantined') {
+          res.status(409).json({
+            ok: false,
+            code: 'recovery_target_invalid',
+            message: `恢复目标凭据当前处置状态为 ${target.disposition}，只有隔离中（quarantined）的凭据才能被新注册替代`,
+            current: credentialInfo(target),
+          });
+          return;
+        }
+        recoverySnapshot = { credentialId: target.credentialId, dispositionVersion: target.dispositionVersion };
+      }
 
       const options: RegistrationOptionsDTO = {
         ceremonyId: '',
@@ -109,10 +151,12 @@ export function createApp(deps: AppDeps): Express {
         },
         attestation: body.attestation ?? 'none',
         excludeCredentials,
+        recoveryOf: recoverySnapshot?.credentialId,
         expiresAt: 0,
         timeout: ttl,
       };
       const ceremony = store.createCeremony('registration', challenge, options, ttl);
+      if (recoverySnapshot) store.attachRecovery(ceremony, recoverySnapshot.credentialId);
       options.ceremonyId = ceremony.id;
       options.expiresAt = ceremony.expiresAt;
       res.json(options);
@@ -147,7 +191,7 @@ export function createApp(deps: AppDeps): Express {
       }
 
       const options = ceremony.options as RegistrationOptionsDTO;
-      store.saveCredential({
+      const newCred: StoredCredential = {
         credentialId: result.credentialId,
         publicKey: result.publicKey,
         counter: result.counter,
@@ -156,9 +200,58 @@ export function createApp(deps: AppDeps): Express {
         rpId: config.rpId,
         resident: body.residentHint ?? options.authenticatorSelection.residentKey !== 'discouraged',
         createdAt: new Date().toISOString(),
-      });
+        disposition: 'active',
+        dispositionVersion: 0,
+        dispositionHistory: [
+          {
+            ceremonyId: ceremony.id,
+            disposition: 'active',
+            reason: 'enrolled',
+            detail: ceremony.recovery
+              ? '恢复注册：通过完整注册校验链后建立的替代凭据'
+              : '注册校验链通过，凭据入库',
+            at: new Date().toISOString(),
+          },
+        ],
+      };
+
+      if (ceremony.recovery) {
+        const recovery = store.completeRecovery(newCred, ceremony.id);
+        if (!recovery.ok) {
+          store.fail(ceremony.id, recovery.code, recovery.message, [
+            ...result.checks,
+            {
+              check: 'recovery.targetVersion',
+              ok: false,
+              detail: recovery.message,
+            },
+          ]);
+          res.status(409).json({
+            ok: false,
+            code: recovery.code,
+            message: recovery.message,
+            current: recovery.current ? credentialInfo(recovery.current) : undefined,
+            checks: result.checks,
+          });
+          return;
+        }
+        store.complete(ceremony.id, { checks: result.checks, credentialId: result.credentialId });
+        res.json({
+          ...result,
+          ceremonyId: ceremony.id,
+          credentialDisposition: 'active' as const,
+          recovery: {
+            recoveryOfCredentialId: recovery.oldCredential.credentialId,
+            replacedByCredentialId: recovery.newCredential.credentialId,
+            cloneWarningCeremonyId: recovery.oldCredential.cloneWarningCeremonyId,
+          },
+        });
+        return;
+      }
+
+      store.saveCredential(newCred);
       store.complete(ceremony.id, { checks: result.checks, credentialId: result.credentialId });
-      res.json({ ...result, ceremonyId: ceremony.id });
+      res.json({ ...result, ceremonyId: ceremony.id, credentialDisposition: 'active' as const });
     }),
   );
 
@@ -178,7 +271,9 @@ export function createApp(deps: AppDeps): Express {
 
       let allowCredentials: AuthenticationOptionsDTO['allowCredentials'] = [];
       if (!body.discoverable) {
-        const creds = body.userName ? store.credentialsForUser(body.userName) : store.allCredentials();
+        // 隔离中的凭据仍下发到 allowCredentials，让客户端能选中它、
+        // 由服务端处置门禁产出可解释的被拦截终态；已撤销的凭据不再下发。
+        const creds = store.authenticatableCredentials(body.userName);
         allowCredentials = creds.map((c) => ({
           type: 'public-key' as const,
           id: c.credentialId,
@@ -202,7 +297,7 @@ export function createApp(deps: AppDeps): Express {
     }),
   );
 
-  // ---------- 认证：校验 assertion（计数器 / 克隆告警） ----------
+  // ---------- 认证：校验 assertion（计数器 / 克隆告警 / 处置门禁） ----------
 
   app.post(
     '/api/authenticate/result',
@@ -232,21 +327,103 @@ export function createApp(deps: AppDeps): Express {
           : undefined,
       });
 
+      // 处置门禁在密码学校验链之后判定：
+      // 1) 必须确认这是一枚"真实断言"（签名等全部通过），隔离/撤销才有依据；
+      // 2) options 可能在隔离生效前签发，提交时以服务端当前处置状态为准，
+      //    已签发 options 不能绕过隔离，更大的计数器也不能自行解除隔离。
+      if (result.ok && stored && stored.disposition !== 'active') {
+        const blockedCheck: CheckResult =
+          stored.disposition === 'quarantined'
+            ? {
+                check: 'credential.disposition',
+                ok: false,
+                detail:
+                  `凭据处于隔离（quarantined，v${stored.dispositionVersion}，告警仪式 ${stored.cloneWarningCeremonyId ?? '?'}）：` +
+                  '即使本次签名有效、计数器递增，也不能完成新认证；需操作员维持隔离/撤销并由用户重新注册恢复',
+              }
+            : {
+                check: 'credential.disposition',
+                ok: false,
+                detail: stored.replacedByCredentialId
+                  ? `凭据已被恢复注册替代并撤销（替代凭据 ${stored.replacedByCredentialId}），不得再次使用`
+                  : '凭据已被操作员撤销（revoked），即使私钥仍留在软件 authenticator 中也不得再次使用',
+              };
+        const code: FailureCode =
+          stored.disposition === 'quarantined' ? 'credential_quarantined' : 'credential_revoked';
+        const message = blockedCheck.detail ?? '凭据当前处置状态不允许完成认证';
+        store.fail(ceremony.id, code, message, [...result.checks, blockedCheck]);
+        res.status(403).json({
+          ok: false,
+          code,
+          message,
+          checks: [...result.checks, blockedCheck],
+          credential: credentialInfo(stored),
+        });
+        return;
+      }
+
       if (!result.ok) {
         store.fail(ceremony.id, result.code, result.message, result.checks);
         res.status(422).json(result);
         return;
       }
 
-      // 计数器：即使触发克隆告警也推进到已见最大值，保证终态可解释、可继续
+      // 计数器：即使触发克隆告警也推进到已见最大值，保证终态可解释；
+      // 同时把凭据置为隔离——这是服务端校验真实断言后产生的状态，而非前端标记。
       store.updateCounter(result.credentialId, Math.max(result.counter, stored?.counter ?? 0));
+      const quarantined = result.cloneWarning
+        ? store.quarantineOnCloneWarning(result.credentialId, ceremony.id)
+        : false;
       store.complete(ceremony.id, {
         checks: result.checks,
         credentialId: result.credentialId,
         cloneWarning: result.cloneWarning,
       });
-      res.json({ ...result, ceremonyId: ceremony.id });
+      const after = store.getCredential(result.credentialId);
+      res.json({
+        ...result,
+        ceremonyId: ceremony.id,
+        credentialDisposition: after?.disposition ?? 'active',
+        dispositionVersion: after?.dispositionVersion,
+        quarantined,
+      });
     }),
+  );
+
+  // ---------- 凭据处置：维持隔离 / 撤销（乐观并发） ----------
+
+  app.post(
+    '/api/credentials/:id/disposition',
+    (req, res) => {
+      const action = req.body?.action as CredentialDispositionAction;
+      const expectedVersion =
+        typeof req.body?.expectedVersion === 'number' ? (req.body.expectedVersion as number) : undefined;
+      if (action !== 'maintain_quarantine' && action !== 'revoke') {
+        res.status(400).json({
+          ok: false,
+          code: 'invalid_disposition_action',
+          message: `action 必须是 maintain_quarantine 或 revoke，收到 ${String(action)}`,
+        });
+        return;
+      }
+      const applied = store.applyDisposition(req.params.id, action, expectedVersion);
+      if (!applied.ok) {
+        const httpStatus =
+          applied.code === 'unknown_credential'
+            ? 404
+            : applied.code === 'disposition_conflict'
+              ? 409
+              : 409;
+        res.status(httpStatus).json({
+          ok: false,
+          code: applied.code,
+          message: applied.message,
+          current: applied.current ? store.toCredentialInfo(applied.current) : undefined,
+        });
+        return;
+      }
+      res.json({ ok: true, credential: store.toCredentialInfo(applied.credential) });
+    },
   );
 
   // ---------- 仪式管理 ----------

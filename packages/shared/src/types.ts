@@ -27,6 +27,8 @@ export interface RegistrationOptionsDTO {
   };
   attestation: AttestationConveyance;
   excludeCredentials: PublicKeyCredentialDescriptorJSON[];
+  /** 恢复注册：替代哪一枚处于隔离中的异常凭据（服务端在签发时校验并快照版本） */
+  recoveryOf?: B64u;
   /** 服务端绝对过期时间（epoch ms） */
   expiresAt: number;
   timeout: number;
@@ -84,7 +86,13 @@ export type FailureCode =
   | 'duplicate_credential'
   | 'unknown_credential'
   | 'user_handle_mismatch'
-  | 'bad_format';
+  | 'bad_format'
+  // 异常凭据处置
+  | 'credential_quarantined'
+  | 'credential_revoked'
+  | 'invalid_disposition_action'
+  | 'disposition_conflict'
+  | 'recovery_target_invalid';
 
 export type CeremonyKind = 'registration' | 'authentication';
 
@@ -131,9 +139,45 @@ export interface CeremonyRecord {
     failureCode?: FailureCode;
     failureMessage?: string;
     cloneWarning?: boolean;
+    /** 认证/注册终态后该凭据在服务端的处置状态（克隆告警后为 quarantined 等） */
+    credentialDisposition?: CredentialDisposition;
+    /** 恢复注册完成后，与原异常凭据的关联 */
+    recovery?: {
+      recoveryOfCredentialId: B64u;
+      replacedByCredentialId: B64u;
+      cloneWarningCeremonyId?: string;
+    };
     checks: CheckResult[];
   };
   steps: StepEntry[];
+}
+
+/**
+ * 凭据处置状态（服务端权威，前端只展示不持有）：
+ * - active：正常可用
+ * - quarantined：计数器克隆告警后隔离，不能完成新认证，等待操作员审阅
+ * - revoked：操作员撤销或被恢复仪式替代，永久不可再用（即使私钥仍留在某 authenticator 中）
+ */
+export type CredentialDisposition = 'active' | 'quarantined' | 'revoked';
+
+/** 凭据处置动作 */
+export type CredentialDispositionAction = 'maintain_quarantine' | 'revoke';
+
+/** 处置状态变更证据（全部为公开信息，不含私钥；时间来自可注入时钟） */
+export interface DispositionEvent {
+  /** 触发该状态的仪式 id（克隆告警仪式 / 恢复注册仪式）；操作员手动动作为 null */
+  ceremonyId: string | null;
+  /** 变更后的处置状态 */
+  disposition: CredentialDisposition;
+  /** 导致状态变化的原因码 */
+  reason:
+    | 'enrolled'
+    | 'clone_warning'
+    | 'operator_maintain_quarantine'
+    | 'operator_revoke'
+    | 'replaced_by_recovery';
+  detail: string;
+  at: string;
 }
 
 export interface StoredCredentialInfo {
@@ -145,6 +189,19 @@ export interface StoredCredentialInfo {
   resident: boolean;
   createdAt: string;
   publicKey: { x: B64u; y: B64u };
+  /** 当前处置状态（服务端权威） */
+  disposition: CredentialDisposition;
+  /** 单调递增的处置版本，操作员动作通过它做乐观并发 */
+  dispositionVersion: number;
+  /** 产生隔离/撤销的克隆告警仪式 id（若有） */
+  cloneWarningCeremonyId?: string;
+  /** 恢复注册建立的替代凭据 id（旧凭据被替代时） */
+  replacedByCredentialId?: B64u;
+  /** 该凭据替代了哪一枚异常凭据（恢复凭据上存在） */
+  recoveryOfCredentialId?: B64u;
+  /** 关联的恢复注册仪式 id（恢复凭据上存在） */
+  recoveryCeremonyId?: string;
+  dispositionHistory: DispositionEvent[];
 }
 
 export interface CeremonySummary {
@@ -156,4 +213,6 @@ export interface CeremonySummary {
   cloneWarning?: boolean;
   createdAt: string;
   expiresAt: number;
+  /** 该仪式涉及的凭据 id（完成后落库） */
+  credentialId?: string;
 }

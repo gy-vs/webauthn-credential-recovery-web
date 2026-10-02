@@ -43,6 +43,8 @@ export interface LabConfig {
   attestation: AttestationConveyance;
   discoverable: boolean;
   ttlMs: number | null; // null = 服务端默认
+  /** 恢复注册：替代哪一枚隔离中的服务端凭据 */
+  recoveryOf?: string;
 }
 
 export interface RunHooks {
@@ -80,19 +82,28 @@ function serverResultFrom(reply: ServerReply): CeremonyRecord['serverResult'] {
   const d = reply.data;
   const checks = (d.checks as CheckResult[] | undefined) ?? [];
   if (d.ok === true) {
+    const recovery = d.recovery as CeremonyRecord['serverResult']['recovery'] | undefined;
     return {
       status: d.cloneWarning ? 'completed_with_clone_warning' : 'completed',
       cloneWarning: Boolean(d.cloneWarning),
+      credentialDisposition: (d.credentialDisposition as CeremonyRecord['serverResult']['credentialDisposition']) ?? 'active',
+      recovery,
       checks,
     };
   }
   const code = d.code as FailureCode | undefined;
   const status: CeremonyStatus =
     code === 'ceremony_cancelled' ? 'cancelled' : code === 'challenge_expired' ? 'expired' : 'failed';
+  // 被处置门禁拦截（隔离/撤销/恢复冲突）：把服务端返回的处置状态也带给记录
+  const dispositionByCode: Partial<Record<string, CeremonyRecord['serverResult']['credentialDisposition']>> = {
+    credential_quarantined: 'quarantined',
+    credential_revoked: 'revoked',
+  };
   return {
     status,
     failureCode: code,
     failureMessage: typeof d.message === 'string' ? d.message : undefined,
+    credentialDisposition: code ? dispositionByCode[code] : undefined,
     checks,
   };
 }
@@ -131,11 +142,26 @@ export async function runRegistration(
     userVerification: cfg.userVerification,
     attestation: cfg.attestation,
     ...(cfg.ttlMs !== null ? { ttlMs: cfg.ttlMs } : {}),
+    ...(cfg.recoveryOf ? { recoveryOf: cfg.recoveryOf } : {}),
   };
-  rec.add('client', 'client.request.registerOptions', reqBody);
+  rec.add(
+    'client',
+    'client.request.registerOptions',
+    reqBody,
+  );
+  if (cfg.recoveryOf) {
+    rec.add('client', 'client.recovery.begin', { recoveryOf: cfg.recoveryOf }, undefined,
+      '恢复流程：为隔离中的异常凭据发起新的注册仪式（不是手工改计数器，也不是重置服务端）');
+  }
   const optionsRes = await api.registerOptions(reqBody);
   const options = optionsRes.data;
-  rec.add('server', 'server.issue.registerOptions', undefined, options, `challenge 一次性，TTL=${options.timeout}ms`);
+  rec.add(
+    'server',
+    'server.issue.registerOptions',
+    undefined,
+    options,
+    `challenge 一次性，TTL=${options.timeout}ms${options.recoveryOf ? '；恢复目标版本已在服务端快照' : ''}`,
+  );
   record.options = options;
   record.ceremonyId = options.ceremonyId;
   record.rpId = options.rp.id;
@@ -202,6 +228,15 @@ export async function runRegistration(
   const result = await api.registerResult(response);
   rec.add('server', 'server.verify.attestation', undefined, result.data, `HTTP ${result.status}`);
   record.serverResult = serverResultFrom(result);
+  if (record.serverResult.recovery) {
+    rec.add(
+      'server',
+      'server.recovery.complete',
+      { recoveryOf: record.serverResult.recovery.recoveryOfCredentialId },
+      record.serverResult.recovery,
+      '新凭据通过完整校验链；服务端撤销旧异常凭据并建立双向关联',
+    );
+  }
   record.steps = rec.steps;
   record.finishedAt = new Date().toISOString();
   return record;
