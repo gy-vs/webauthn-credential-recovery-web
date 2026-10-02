@@ -30,6 +30,13 @@ export interface RegistrationOptionsDTO {
   /** 服务端绝对过期时间（epoch ms） */
   expiresAt: number;
   timeout: number;
+  /**
+   * 恢复注册：替代哪一枚被隔离的凭据（服务端在签发时校验并快照版本）。
+   * 普通注册不出现该字段。
+   */
+  replacesCredentialId?: B64u | null;
+  /** 签发 options 时被替代凭据的处置版本（乐观并发） */
+  replacesVersion?: number;
 }
 
 export interface AuthenticationOptionsDTO {
@@ -84,6 +91,10 @@ export type FailureCode =
   | 'duplicate_credential'
   | 'unknown_credential'
   | 'user_handle_mismatch'
+  | 'credential_quarantined'
+  | 'credential_revoked'
+  | 'disposition_conflict'
+  | 'recovery_target_invalid'
   | 'bad_format';
 
 export type CeremonyKind = 'registration' | 'authentication';
@@ -133,7 +144,55 @@ export interface CeremonyRecord {
     cloneWarning?: boolean;
     checks: CheckResult[];
   };
+  /** 恢复注册结果：本次新注册替代了哪枚隔离凭据（关联原异常） */
+  recovery?: {
+    replacedCredentialId: B64u;
+    newCredentialId: B64u;
+  };
   steps: StepEntry[];
+}
+
+/**
+ * 凭据处置状态：
+ * - active：正常可用
+ * - quarantined：计数器克隆告警后被隔离，不能再完成认证，但凭据仍保留待审阅
+ * - revoked：操作员撤销（手动撤销或被恢复注册替代），永久不可认证
+ */
+export type CredentialDisposition = 'active' | 'quarantined' | 'revoked';
+
+/** 凭据处置动作（与 dispositionHistory 中 action 对应） */
+export type CredentialDispositionAction =
+  | 'quarantine_clone_warning'
+  | 'maintain_quarantine'
+  | 'revoke_operator'
+  | 'revoke_replaced';
+
+/** 一次处置状态变化的证据（全部来自服务端，浏览器不可伪造） */
+export interface DispositionEvent {
+  action: CredentialDispositionAction;
+  /** 触发该变化的仪式 id（克隆告警仪式 / 恢复注册仪式），操作员动作为 null */
+  ceremonyId: string | null;
+  from: CredentialDisposition;
+  to: CredentialDisposition;
+  at: string; // ISO 时间
+  note?: string;
+  /** 关联的另一枚凭据（恢复注册：新凭据 id） */
+  relatedCredentialId?: B64u;
+}
+
+/** 凭据当前处置的完整快照（含状态、版本、证据链） */
+export interface CredentialDispositionInfo {
+  state: CredentialDisposition;
+  /** 乐观并发版本：每次处置变化递增，处置动作必须带当时看到的版本 */
+  version: number;
+  /** 使凭据进入隔离的告警仪式（quarantined/revoked 时存在） */
+  evidenceCeremonyId?: string;
+  updatedAt: string;
+  history: DispositionEvent[];
+  /** 恢复关联：被哪枚新凭据替代（旧凭据） */
+  replacedByCredentialId?: B64u;
+  /** 恢复关联：替代了哪枚凭据（新凭据） */
+  replacesCredentialId?: B64u;
 }
 
 export interface StoredCredentialInfo {
@@ -145,6 +204,7 @@ export interface StoredCredentialInfo {
   resident: boolean;
   createdAt: string;
   publicKey: { x: B64u; y: B64u };
+  disposition: CredentialDispositionInfo;
 }
 
 export interface CeremonySummary {

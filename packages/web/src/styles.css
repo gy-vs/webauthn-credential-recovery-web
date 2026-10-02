@@ -193,3 +193,23 @@ header h1 { font-size: 20px; margin: 0; }
 
 .import-controls { display: flex; gap: 8px; margin: 8px 0; align-items: center; }
 .import-controls input[type="file"] { width: auto; }
+
+/* 凭据处置 */
+.cred-card {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  margin: 8px 0;
+  background: #161d25;
+}
+.cred-card-quarantined { border-color: var(--warn); }
+.cred-card-revoked { border-color: var(--bad); opacity: 0.85; }
+.cred-row { display: flex; align-items: center; gap: 8px; justify-content: space-between; }
+.disposition-active { color: var(--ok); border-color: var(--ok); }
+.disposition-quarantined { color: var(--warn); border-color: var(--warn); }
+.disposition-revoked { color: var(--bad); border-color: var(--bad); }
+.disposition-actions { margin-top: 8px; display: flex; flex-direction: column; gap: 6px; }
+.disposition-actions input { font-size: 12px; }
+.disposition-history { margin-top: 6px; }
+.disposition-history summary { cursor: pointer; color: var(--muted); font-size: 12px; }
+.step-server .actor { color: var(--accent); }

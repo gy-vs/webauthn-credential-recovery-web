@@ -7,6 +7,7 @@ import {
 } from '@lab/shared';
 import { api, type ServerConfig } from './api';
 import { CeremonyDetail, StatusBadge } from './components/CeremonyDetail';
+import { CredentialCard } from './components/CredentialCard';
 import { exportRecord, ImportPanel } from './components/ImportPanel';
 import {
   runAuthentication,
@@ -64,18 +65,24 @@ export default function App() {
 
   const active = handles.find((h) => h.id === activeId) ?? handles[0]!;
 
+  const refreshCredentials = useCallback(async () => {
+    const { data } = await api.credentials();
+    setCredentials(data);
+  }, []);
+
   useEffect(() => {
     api.config().then(({ data }) => {
       setServerConfig(data);
       setCfg((c) => ({ ...c, origin: c.origin || data.expectedOrigins[0] || '' }));
     });
     refreshCredentials();
-  }, []);
+  }, [refreshCredentials]);
 
-  const refreshCredentials = useCallback(async () => {
-    const { data } = await api.credentials();
-    setCredentials(data);
-  }, []);
+  // 切换 authenticator 句柄时重新拉取凭据库：处置状态始终以服务端为准，
+  // 不依赖当前组件里的临时选择
+  useEffect(() => {
+    void refreshCredentials();
+  }, [activeId, refreshCredentials]);
 
   const exec = useCallback(
     async (label: string, fn: () => Promise<CeremonyRecord[]>) => {
@@ -179,6 +186,90 @@ export default function App() {
     setRecords([]);
     await refreshCredentials();
   };
+
+  // ---- 异常凭据处置：所有动作都以服务端确认后的凭据列表为准 ----
+
+  const applyCredentialAction = useCallback(
+    async (
+      label: string,
+      fn: () => Promise<CeremonyRecord[] | void>,
+    ) => {
+      setBusy(label);
+      setError(null);
+      try {
+        const produced = await fn();
+        if (produced) setRecords((rs) => [...produced.reverse(), ...rs]);
+        setSelected(0);
+      } catch (e) {
+        setError(`${label} 执行异常：${(e as Error).message}`);
+      } finally {
+        // 无论成功失败都重新拉取：处置状态以服务端为准，失败时也要反映当前状态
+        await refreshCredentials();
+        setBusy(null);
+      }
+    },
+    [refreshCredentials],
+  );
+
+  const handleDisposition = useCallback(
+    async (cred: StoredCredentialInfo, action: 'maintain_quarantine' | 'revoke_operator', note?: string) => {
+      // 不经过 applyCredentialAction 的吞错包装：冲突（ApiError）要抛给卡片内联展示，
+      // 但无论成功失败都重新拉取服务端状态
+      setBusy(action === 'revoke_operator' ? '撤销凭据' : '维持隔离');
+      setError(null);
+      try {
+        await api.disposition(cred.credentialId, { action, expectedVersion: cred.disposition.version, note });
+      } finally {
+        await refreshCredentials();
+        setBusy(null);
+      }
+    },
+    [refreshCredentials],
+  );
+
+  /**
+   * 隔离/撤销凭据仍留在某个软件 authenticator 中，用它再发起一次认证：
+   * options 不会包含它（allowCredentials 已过滤），客户端用测试钩子强制出断言，
+   * 服务端必须凭处置状态拒绝（而不是靠列表过滤）。
+   */
+  const handleAuthenticateAttempt = useCallback(
+    (cred: StoredCredentialInfo) => {
+      const owner = handles.find((h) =>
+        h.auth.listCredentials().some((lc) => lc.credentialId === cred.credentialId),
+      );
+      if (!owner) {
+        setError(`凭据 ${cred.credentialId.slice(0, 12)}… 不在当前任何软件 authenticator 句柄中（页面已切换/新建过句柄），无法在本页强制出断言`);
+        return;
+      }
+      void applyCredentialAction('隔离凭据再认证', async () => {
+        const record = await runAuthentication(owner, { ...cfg, userName: cred.userName }, {
+          forceAssertionCredentialId: cred.credentialId,
+        });
+        return [record];
+      });
+    },
+    [handles, cfg, applyCredentialAction],
+  );
+
+  /**
+   * 恢复：新建一个软件 authenticator（替代凭据必须在新 authenticator 上注册），
+   * 携带 replacesCredentialId 走完整注册检查链。旧凭据由服务端在验签通过后原子撤销。
+   */
+  const handleRecover = useCallback(
+    (cred: StoredCredentialInfo) => {
+      const newHandle = createHandle(`recovery-${handleSeq}`);
+      setHandles((hs) => [...hs, newHandle]);
+      setActiveId(newHandle.id);
+      void exec('恢复注册（替代隔离凭据）', () =>
+        runRegistration(newHandle, {
+          ...cfg,
+          userName: cred.userName,
+          replacesCredentialId: cred.credentialId,
+        }).then((r) => [r]),
+      );
+    },
+    [cfg, exec],
+  );
 
   return (
     <div className="app">
@@ -304,14 +395,28 @@ export default function App() {
           </section>
 
           <section className="panel">
-            <h3>服务端凭据库（内存）</h3>
+            <h3>
+              服务端凭据库（内存）
+              <button
+                type="button"
+                style={{ marginLeft: 8 }}
+                onClick={() => { void refreshCredentials(); }}
+                disabled={busy !== null}
+                title="重新从服务端拉取处置状态（切换句柄/另一页面处置后）"
+              >
+                刷新
+              </button>
+            </h3>
             {credentials.length === 0 && <p className="muted">空</p>}
             {credentials.map((c) => (
-              <div key={c.credentialId} className="cred">
-                <code title={c.credentialId}>{c.credentialId.slice(0, 12)}…</code>
-                <span className="muted">{c.userName}{c.resident ? ' / resident' : ''}</span>
-                <span>计数器 {c.counter}</span>
-              </div>
+              <CredentialCard
+                key={c.credentialId}
+                credential={c}
+                busy={busy !== null}
+                onAuthenticateAttempt={handleAuthenticateAttempt}
+                onDisposition={handleDisposition}
+                onRecover={handleRecover}
+              />
             ))}
             <button type="button" className="danger" onClick={resetAll}>重置服务端状态</button>
           </section>

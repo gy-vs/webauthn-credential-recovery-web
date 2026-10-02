@@ -60,7 +60,13 @@ export function CeremonyDetail({ record, onExport }: { record: CeremonyRecord; o
         </div>
       )}
       {record.serverResult.cloneWarning && (
-        <div className="clone-warning">⚠️ 计数器回退：疑似克隆 authenticator（仪式仍到达可解释终态）</div>
+        <div className="clone-warning">⚠️ 计数器回退：疑似克隆 authenticator（仪式仍到达可解释终态，对应凭据已由服务端隔离）</div>
+      )}
+      {record.recovery && (
+        <div className="import-valid">
+          🔑 恢复完成：新凭据 <code>{record.recovery.newCredentialId.slice(0, 12)}…</code> 经完整注册检查链验证，
+          已替代异常旧凭据 <code>{record.recovery.replacedCredentialId.slice(0, 12)}…</code>（旧凭据已撤销）
+        </div>
       )}
       <h4>服务端检查链</h4>
       <ChecksView checks={record.serverResult.checks} />

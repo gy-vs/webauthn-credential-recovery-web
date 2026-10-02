@@ -43,6 +43,8 @@ export interface LabConfig {
   attestation: AttestationConveyance;
   discoverable: boolean;
   ttlMs: number | null; // null = 服务端默认
+  /** 恢复注册：替代哪枚被隔离的凭据（空 = 普通注册） */
+  replacesCredentialId?: string | null;
 }
 
 export interface RunHooks {
@@ -52,6 +54,8 @@ export interface RunHooks {
   cancelBeforeSubmit?: boolean;
   /** 篡改签名（签名失败场景） */
   tamperSignature?: boolean;
+  /** 强制 authenticator 用该凭据出断言（隔离/撤销凭据仍留在 authenticator 中再尝试） */
+  forceAssertionCredentialId?: string;
 }
 
 const crypto = createWebCrypto();
@@ -97,6 +101,22 @@ function serverResultFrom(reply: ServerReply): CeremonyRecord['serverResult'] {
   };
 }
 
+/**
+ * 把 API 调用包装为 {status, data}，与既有步骤记录方式兼容：
+ * 4xx（含隔离/撤销门禁、处置冲突）也作为"服务端答复"进入步骤链，而不是抛异常。
+ */
+async function capture<T>(call: Promise<{ status: number; data: T }>): Promise<{ status: number; data: Record<string, unknown> }> {
+  try {
+    const r = await call;
+    return { status: r.status, data: r.data as Record<string, unknown> };
+  } catch (e) {
+    if (e instanceof Error && 'status' in e && 'data' in e) {
+      return { status: (e as { status: number }).status, data: (e as { data: Record<string, unknown> }).data };
+    }
+    throw e;
+  }
+}
+
 function baseRecord(kind: CeremonyRecord['kind'], ceremonyId: string, cfg: LabConfig): CeremonyRecord {
   return {
     version: 1,
@@ -131,11 +151,28 @@ export async function runRegistration(
     userVerification: cfg.userVerification,
     attestation: cfg.attestation,
     ...(cfg.ttlMs !== null ? { ttlMs: cfg.ttlMs } : {}),
+    ...(cfg.replacesCredentialId ? { replacesCredentialId: cfg.replacesCredentialId } : {}),
   };
   rec.add('client', 'client.request.registerOptions', reqBody);
-  const optionsRes = await api.registerOptions(reqBody);
-  const options = optionsRes.data;
-  rec.add('server', 'server.issue.registerOptions', undefined, options, `challenge 一次性，TTL=${options.timeout}ms`);
+  const optionsRes = await capture(api.registerOptions(reqBody));
+  if (optionsRes.data.ok === false) {
+    // 签发阶段失败（如恢复目标无效）：记录为一条没有后续断言的失败记录
+    rec.add('server', 'server.issue.registerOptions', undefined, optionsRes.data, `HTTP ${optionsRes.status}`);
+    record.steps = rec.steps;
+    record.finishedAt = new Date().toISOString();
+    record.serverResult = serverResultFrom(optionsRes);
+    return record;
+  }
+  const options = optionsRes.data as unknown as RegistrationOptionsDTO;
+  rec.add(
+    'server',
+    'server.issue.registerOptions',
+    undefined,
+    options,
+    options.replacesCredentialId
+      ? `恢复注册：替代隔离凭据 ${options.replacesCredentialId.slice(0, 12)}…（版本快照 ${options.replacesVersion}），TTL=${options.timeout}ms`
+      : `challenge 一次性，TTL=${options.timeout}ms`,
+  );
   record.options = options;
   record.ceremonyId = options.ceremonyId;
   record.rpId = options.rp.id;
@@ -199,9 +236,20 @@ export async function runRegistration(
     residentHint: made.resident,
   };
   rec.add('client', 'client.submit.attestation', response);
-  const result = await api.registerResult(response);
+  const result = await capture(api.registerResult(response));
   rec.add('server', 'server.verify.attestation', undefined, result.data, `HTTP ${result.status}`);
   record.serverResult = serverResultFrom(result);
+  const recovery = (result.data as { recovery?: { replacedCredentialId: string; newCredentialId: string } }).recovery;
+  if (recovery) {
+    record.recovery = recovery;
+    rec.add(
+      'server',
+      'server.recovery.linked',
+      undefined,
+      recovery,
+      `恢复完成：旧凭据 ${recovery.replacedCredentialId.slice(0, 12)}… 已撤销，新凭据 ${recovery.newCredentialId.slice(0, 12)}… 生效`,
+    );
+  }
   record.steps = rec.steps;
   record.finishedAt = new Date().toISOString();
   return record;
@@ -223,8 +271,8 @@ export async function runAuthentication(
     ...(cfg.ttlMs !== null ? { ttlMs: cfg.ttlMs } : {}),
   };
   rec.add('client', 'client.request.authOptions', reqBody);
-  const optionsRes = await api.authenticateOptions(reqBody);
-  const options: AuthenticationOptionsDTO = optionsRes.data;
+  const optionsRes = await capture(api.authenticateOptions(reqBody));
+  const options: AuthenticationOptionsDTO = optionsRes.data as unknown as AuthenticationOptionsDTO;
   rec.add('server', 'server.issue.authOptions', undefined, options,
     options.allowCredentials.length === 0 ? 'discoverable：allowCredentials 为空（resident key 流程）' : undefined);
   record.options = options;
@@ -243,6 +291,12 @@ export async function runAuthentication(
   record.clientDataJSON = b64uEncode(clientDataJSON);
 
   const clientDataHash = await crypto.sha256(clientDataJSON);
+  if (hooks.forceAssertionCredentialId) {
+    handle.auth.debugForceAssertionCredential(hooks.forceAssertionCredentialId);
+    rec.add('authenticator', 'authenticator.debug.forceAssertionCredential', undefined, {
+      credentialId: hooks.forceAssertionCredentialId,
+    }, '测试钩子：无视 allowCredentials 强制该凭据出断言（隔离/撤销凭据仍留在 authenticator 中再尝试）');
+  }
   let assertion;
   try {
     assertion = await handle.auth.getAssertion({
@@ -295,7 +349,7 @@ export async function runAuthentication(
     userHandle: b64uEncode(assertion.userHandle),
   };
   rec.add('client', 'client.submit.assertion', response);
-  const result = await api.authenticateResult(response);
+  const result = await capture(api.authenticateResult(response));
   rec.add('server', 'server.verify.assertion', undefined, result.data, `HTTP ${result.status}`);
   record.serverResult = serverResultFrom(result);
   record.steps = rec.steps;

@@ -87,6 +87,8 @@ export class SoftwareAuthenticator {
   private readonly creds = new Map<string, StoredCredential>();
   /** 测试钩子：强制下一次 makeCredential 复用该 credential id（制造重复 id 场景） */
   private forcedCredentialId: Uint8Array | null = null;
+  /** 测试钩子：强制下一次 getAssertion 使用该 credential id（base64url），无视 allowCredentials（隔离凭据仍留在 authenticator 中再次尝试） */
+  private forcedAssertionCredentialId: string | null = null;
 
   constructor(crypto: CryptoProvider, config: AuthenticatorConfig = {}, id?: string) {
     this.crypto = crypto;
@@ -221,7 +223,21 @@ export class SoftwareAuthenticator {
     });
 
     let cred: StoredCredential | undefined;
-    if (params.allowCredentialIds !== undefined) {
+    if (this.forcedAssertionCredentialId) {
+      // 测试钩子：模拟"不守规矩的客户端/仍保留旧凭据的 authenticator"，
+      // 无视服务端签发的 allowCredentials 直接拿指定凭据出断言——
+      // 服务端必须凭处置状态拒绝，而不是靠列表过滤。
+      const forced = this.creds.get(this.forcedAssertionCredentialId);
+      this.forcedAssertionCredentialId = null;
+      if (forced) {
+        this.onEvent('authenticator.debug.forceAssertionCredential', {
+          credentialId: b64uEncode(forced.credentialId),
+          rpId: forced.rpId,
+          reason: '测试钩子：无视 allowCredentials 强制使用该凭据（隔离/撤销凭据再尝试）',
+        });
+        cred = forced;
+      }
+    } else if (params.allowCredentialIds !== undefined) {
       for (const id of params.allowCredentialIds) {
         const c = this.creds.get(id);
         if (c && c.rpId === params.rpId) {
@@ -307,5 +323,13 @@ export class SoftwareAuthenticator {
   /** 强制下一次注册复用已有 credential id（制造 duplicate_credential 场景） */
   debugForceCredentialId(credentialIdB64: string): void {
     this.forcedCredentialId = b64uDecode(credentialIdB64);
+  }
+
+  /** 强制下一次断言使用指定凭据，无视 allowCredentials（隔离/撤销凭据仍留在 authenticator 中再尝试） */
+  debugForceAssertionCredential(credentialIdB64: string): void {
+    if (!this.creds.has(credentialIdB64)) {
+      throw new CodedError('NotFoundError', `unknown credential ${credentialIdB64}`);
+    }
+    this.forcedAssertionCredentialId = credentialIdB64;
   }
 }
